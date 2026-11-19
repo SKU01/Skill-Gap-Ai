@@ -1,7 +1,8 @@
 import os, json, secrets
+from io import BytesIO
 from functools import wraps
 from pathlib import Path
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
@@ -9,6 +10,7 @@ from pypdf import PdfReader
 from docx import Document
 from database import init_db, get_db
 from ai_engine import extract_skills, semantic_match
+from pdf_generator import create_report_pdf
 
 app = Flask(__name__)
 CORS(app)
@@ -66,10 +68,13 @@ def login():
     TOKENS[token] = student["student_id"]
     return jsonify({"token":token,"student":{"id":student["student_id"],"name":student["name"],"email":student["email"]}})
 
+# Ensure database schema and seed data are up to date
+init_db()
+
 @app.get("/api/roles")
 def roles():
     with get_db() as db:
-        rows = db.execute("SELECT role_id,role_name,description FROM job_roles ORDER BY role_name").fetchall()
+        rows = db.execute("SELECT role_id,role_name,description,display_order FROM job_roles ORDER BY display_order ASC, role_id ASC").fetchall()
     return jsonify([dict(r) for r in rows])
 
 @app.get("/api/me")
@@ -143,12 +148,102 @@ def analyze():
                 row = db.execute("SELECT skill_id FROM skills WHERE skill_name=?",(item["skill"],)).fetchone()
                 if row: top_skill_ids.append(row["skill_id"])
         courses = []
+        seen_titles = set()
         for sid in top_skill_ids:
             c = db.execute("SELECT title,provider,level,url FROM courses WHERE skill_id=?",(sid,)).fetchall()
-            courses.extend([dict(x) for x in c])
+            for x in c:
+                if x["title"] not in seen_titles:
+                    seen_titles.add(x["title"])
+                    courses.append(dict(x))
     return jsonify({"role":role["role_name"],"extracted_skills":extracted,
                     "marks":marks,"report":report,"recommendations":courses[:8],
                     "note":"Resume detection indicates skill presence only. Review and adjust self-ratings for a more accurate proficiency estimate."})
+
+@app.route("/api/report/pdf", methods=["GET", "POST"])
+@auth_required
+def download_report_pdf():
+    with get_db() as db:
+        student = db.execute("SELECT student_id, name, email, branch, year, target_role_id FROM students WHERE student_id=?",
+                             (request.student_id,)).fetchone()
+    if not student:
+        return jsonify({"error": "Student profile not found."}), 404
+
+    student_dict = dict(student)
+    report_data = None
+
+    if request.method == "POST":
+        data = request.get_json(silent=True) or {}
+        report_data = data.get("report") or data
+
+    if not report_data or not isinstance(report_data, dict) or not report_data.get("report"):
+        target_role_id = student["target_role_id"]
+        if not target_role_id:
+            return jsonify({"error": "No previous analysis found. Please run an analysis first."}), 400
+
+        with get_db() as db:
+            role = db.execute("SELECT * FROM job_roles WHERE role_id=?", (target_role_id,)).fetchone()
+            if not role:
+                return jsonify({"error": "Job role not found."}), 404
+
+            skills_rows = db.execute("""
+                SELECT s.skill_id, s.skill_name, s.category, rs.required_level, rs.weight,
+                       COALESCE(ss.level, 0) as current_level
+                FROM role_skills rs
+                JOIN skills s ON s.skill_id = rs.skill_id
+                LEFT JOIN student_skills ss ON ss.skill_id = rs.skill_id AND ss.student_id = ?
+                WHERE rs.role_id = ?
+            """, (request.student_id, target_role_id)).fetchall()
+
+            report = []
+            top_skill_ids = []
+            for r in skills_rows:
+                current = int(r["current_level"])
+                req = int(r["required_level"])
+                gap = max(0, req - current)
+                score = round(gap * float(r["weight"]), 2)
+                report.append({
+                    "skill": r["skill_name"],
+                    "category": r["category"],
+                    "current": current,
+                    "required": req,
+                    "gap": gap,
+                    "weight": r["weight"],
+                    "score": score
+                })
+                if gap > 0:
+                    top_skill_ids.append(r["skill_id"])
+
+            report.sort(key=lambda x: x["score"], reverse=True)
+            courses = []
+            seen_titles = set()
+            for sid in top_skill_ids[:8]:
+                c = db.execute("SELECT title, provider, level, url FROM courses WHERE skill_id=?", (sid,)).fetchall()
+                for x in c:
+                    if x["title"] not in seen_titles:
+                        seen_titles.add(x["title"])
+                        courses.append(dict(x))
+
+            report_data = {
+                "role": role["role_name"],
+                "marks": "",
+                "extracted_skills": [],
+                "report": report,
+                "recommendations": courses[:8],
+                "note": "Resume detection indicates skill presence only. Review and adjust self-ratings for a more accurate proficiency estimate."
+            }
+
+    try:
+        pdf_bytes = create_report_pdf(student_dict, report_data)
+        role_slug = "".join(c if c.isalnum() else "_" for c in report_data.get("role", "Career")).strip("_")
+        filename = f"SkillGapReport_{role_slug}.pdf"
+        return send_file(
+            BytesIO(pdf_bytes),
+            mimetype="application/pdf",
+            as_attachment=True,
+            download_name=filename
+        )
+    except Exception as e:
+        return jsonify({"error": f"Failed to generate PDF: {str(e)}"}), 500
 
 if __name__ == "__main__":
     init_db()

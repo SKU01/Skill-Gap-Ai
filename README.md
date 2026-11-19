@@ -3,12 +3,13 @@
 A beginner-friendly full-stack implementation based on the uploaded research paper.
 
 ## Technology
-- Frontend: React + Vite
-- Backend: Python + Flask REST API
+- Frontend: React + Vite + jsPDF
+- Backend: Python + Flask REST API + ReportLab
 - Database: SQLite
 - NLP: spaCy PhraseMatcher
 - Semantic matching: Sentence-BERT (`all-MiniLM-L6-v2`) with a safe exact-match fallback
 - Resume parsing: PyPDF and python-docx
+- Report export: ReportLab vector PDF generator with client-side jsPDF fallback
 
 ## Requirements
 Install:
@@ -82,6 +83,7 @@ npm run dev
 6. Choose Data Analyst, Python Developer or Frontend Developer.
 7. Optionally enter academic marks.
 8. Generate the report.
+9. Click **Download PDF Report** (at the top header or bottom of the report) to download your full assessment report as a PDF.
 
 ## Important academic notes
 - The paper defines the gap as `max(0, required_level - current_level)`.
